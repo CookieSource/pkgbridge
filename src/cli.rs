@@ -10,6 +10,7 @@ use crate::config;
 use crate::desktop;
 use std::io::IsTerminal;
 use crate::pkgdetect::{detect_package_format, PackageFormat};
+use std::path::PathBuf as StdPathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "pkgbridge", version, about = "Install native packages into Distrobox containers and export CLIs/desktop apps to the host.")]
@@ -403,16 +404,12 @@ fn export_items(box_name: &str, bins: &[String], apps: &[String]) -> Result<()> 
             println!("Name collision for '{}'; exported as '{}'", b, alt);
             continue;
         }
-        let status = std::process::Command::new("distrobox-export")
-            .args(["--container", box_name, "--bin", b])
-            .status();
-        match status {
-            Ok(s) if s.success() => println!("Exported bin: {}", b),
-            Ok(_) | Err(_) => {
-                // Try custom shim as fallback
-                let _ = write_simple_shim(&bin_dir, b, box_name, b);
-                eprintln!("Warning: distrobox-export failed; wrote shim for {}", b);
-            }
+        if export_bin(box_name, b) {
+            println!("Exported bin: {}", b);
+        } else {
+            // Try custom shim as fallback
+            let _ = write_simple_shim(&bin_dir, b, box_name, b);
+            eprintln!("Warning: distrobox-export failed; wrote shim for {}", b);
         }
     }
     let apps_dir = host_apps_dir();
@@ -443,12 +440,10 @@ fn export_items(box_name: &str, bins: &[String], apps: &[String]) -> Result<()> 
             println!("App collision for '{}'; exported as '{}'", base, alt_name);
             continue;
         }
-        let status = std::process::Command::new("distrobox-export")
-            .args(["--container", box_name, "--app", base])
-            .status();
-        match status {
-            Ok(s) if s.success() => println!("Exported app: {}", base),
-            Ok(_) | Err(_) => eprintln!("Warning: failed exporting app {}", base),
+        if export_app(box_name, base) {
+            println!("Exported app: {}", base);
+        } else {
+            eprintln!("Warning: failed exporting app {}", base);
         }
     }
     Ok(())
@@ -476,6 +471,52 @@ fn write_simple_shim(dir: &std::path::Path, out_name: &str, box_name: &str, cmd_
         std::fs::set_permissions(&path, perms)?;
     }
     Ok(())
+}
+
+fn dbe_supports_container_flag() -> bool {
+    if which::which("distrobox-export").is_err() { return false; }
+    match std::process::Command::new("distrobox-export").arg("--help").output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("--container"),
+        Err(_) => false,
+    }
+}
+
+fn export_bin(box_name: &str, bin: &str) -> bool {
+    let supports = dbe_supports_container_flag();
+    if supports {
+        // Try by name first, then fallback to absolute path
+        let status = std::process::Command::new("distrobox-export")
+            .args(["--container", box_name, "--bin", bin])
+            .status();
+        if let Ok(s) = status { if s.success() { return true; } }
+        let abs = format!("/usr/bin/{}", bin);
+        let status2 = std::process::Command::new("distrobox-export")
+            .args(["--container", box_name, "--bin", &abs])
+            .status();
+        return matches!(status2, Ok(s) if s.success());
+    } else {
+        // Older versions: run from inside container, requires absolute path
+        let abs = format!("/usr/bin/{}", bin);
+        let status = std::process::Command::new("distrobox")
+            .args(["enter", "-n", box_name, "--", "distrobox-export", "--bin", &abs])
+            .status();
+        return matches!(status, Ok(s) if s.success());
+    }
+}
+
+fn export_app(box_name: &str, app_base: &str) -> bool {
+    let supports = dbe_supports_container_flag();
+    if supports {
+        let status = std::process::Command::new("distrobox-export")
+            .args(["--container", box_name, "--app", app_base])
+            .status();
+        return matches!(status, Ok(s) if s.success());
+    } else {
+        let status = std::process::Command::new("distrobox")
+            .args(["enter", "-n", box_name, "--", "distrobox-export", "--app", app_base])
+            .status();
+        return matches!(status, Ok(s) if s.success());
+    }
 }
 
 fn scan_installed_pkg(box_name: &str, fam: BoxFamily, pkg: &str) -> Result<(Vec<String>, Vec<String>)> {
@@ -524,12 +565,23 @@ fn uninstall_pkg(cli: &Cli, arg: PkgArg) -> Result<()> {
 }
 
 fn unexport_items(box_name: &str, bins: &[String], apps: &[String]) {
+    let supports = dbe_supports_container_flag();
     for b in bins {
-        let _ = std::process::Command::new("distrobox-export").args(["--container", box_name, "--delete", "--bin", b]).status();
+        if supports {
+            let _ = std::process::Command::new("distrobox-export").args(["--container", box_name, "--delete", "--bin", b]).status();
+        } else {
+            // Older versions expect absolute path and to be run inside the container
+            let abs = format!("/usr/bin/{}", b);
+            let _ = std::process::Command::new("distrobox").args(["enter", "-n", box_name, "--", "distrobox-export", "--delete", "--bin", &abs]).status();
+        }
     }
     for app in apps {
         let base = std::path::Path::new(app).file_name().and_then(|s| s.to_str()).unwrap_or(app);
-        let _ = std::process::Command::new("distrobox-export").args(["--container", box_name, "--delete", "--app", base]).status();
+        if supports {
+            let _ = std::process::Command::new("distrobox-export").args(["--container", box_name, "--delete", "--app", base]).status();
+        } else {
+            let _ = std::process::Command::new("distrobox").args(["enter", "-n", box_name, "--", "distrobox-export", "--delete", "--app", base]).status();
+        }
     }
 }
 
@@ -685,7 +737,7 @@ fn maybe_first_run_prompt() {
                         for line in s.lines() {
                             let base = std::path::Path::new(line.trim()).file_name().and_then(|x| x.to_str()).unwrap_or("");
                             if base.is_empty() { continue; }
-                            let _ = std::process::Command::new("distrobox-export").args(["--container", &b.name, "--app", base]).status();
+                            let _ = export_app(&b.name, base);
                         }
                     }
                 }

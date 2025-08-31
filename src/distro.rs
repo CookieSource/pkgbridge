@@ -81,21 +81,53 @@ fn parse_boxes_json(s: &str) -> Result<Vec<DistroBox>> {
 }
 
 fn parse_boxes_plain(s: &str) -> Vec<DistroBox> {
-    // Heuristic: lines with name and image separated by spaces; try to extract name
-    // Example output often includes a header; skip header lines
+    // Handle two common formats:
+    // 1) Pipe table: "ID | NAME | STATUS | IMAGE"
+    // 2) Space-separated name and image (very old versions)
     let mut boxes = Vec::new();
+    let mut saw_pipe_header = false;
     for line in s.lines() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with("NAME") || t.starts_with("+---") || t.contains("CONTAINER ID") {
+        if t.is_empty() { continue; }
+
+        if t.contains('|') {
+            // Pipe-separated table
+            // Split and trim columns
+            let mut cols: Vec<String> = t.split('|').map(|c| c.trim().to_string()).collect();
+            // Skip header row
+            if cols.iter().any(|c| c.eq_ignore_ascii_case("NAME")) && cols.iter().any(|c| c.eq_ignore_ascii_case("ID")) {
+                saw_pipe_header = true;
+                continue;
+            }
+            // Skip separators like "+---" if present
+            if cols.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == '+')) { continue; }
+            if cols.len() >= 2 {
+                let name = cols.get(1).cloned().unwrap_or_default();
+                if name.is_empty() || name.eq_ignore_ascii_case("NAME") { continue; }
+                let image = cols.get(3).cloned();
+                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+                continue;
+            }
+        }
+
+        // Fallback heuristic for plain whitespace formats
+        if t.starts_with("NAME") || t.starts_with("+---") || t.contains("CONTAINER ID") || t.eq_ignore_ascii_case("id") {
             continue;
         }
-        // Split on whitespace
         let parts: Vec<&str> = t.split_whitespace().collect();
         if parts.len() >= 1 {
-            let name = parts[0].to_string();
-            if name == "NAME" || name == "Created" { continue; }
-            let image = parts.get(1).map(|s| s.to_string());
-            boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+            // If we saw a pipe header earlier, the first column here is likely ID; skip such lines
+            if saw_pipe_header && parts.get(0).map(|c| c.len()).unwrap_or(0) >= 6 && parts.get(1).is_some() {
+                // Likely an ID then NAME; take NAME
+                let name = parts.get(1).unwrap().to_string();
+                let image = parts.get(3).map(|s| s.to_string());
+                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+            } else {
+                let name = parts[0].to_string();
+                if name.eq_ignore_ascii_case("NAME") || name.eq_ignore_ascii_case("Created") { continue; }
+                let image = parts.get(1).map(|s| s.to_string());
+                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+            }
         }
     }
     boxes

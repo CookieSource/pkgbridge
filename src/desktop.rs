@@ -61,13 +61,15 @@ pub fn uninstall(_dry_run: bool) -> Result<()> {
 
 pub fn desktop_file_content() -> String {
     // Minimal .desktop to handle opening .deb/.rpm
-    let exec = "pkgbridge open %f";
+    // Prefer absolute Exec/TryExec to work even if ~/.local/bin isn't on PATH
+    let exec_bin = resolve_exec_bin();
+    let exec = format!("{} open %f", exec_bin);
     let mut s = String::new();
     s.push_str("[Desktop Entry]\n");
     s.push_str("Type=Application\n");
     s.push_str("Name=Pkgbridge Package Installer\n");
     s.push_str("Comment=Install native packages into Distrobox containers\n");
-    s.push_str("TryExec=pkgbridge\n");
+    s.push_str(&format!("TryExec={}\n", exec_bin));
     s.push_str("Icon=pkgbridge\n");
     s.push_str(&format!("Exec={}\n", exec));
     s.push_str("Terminal=true\n");
@@ -76,6 +78,23 @@ pub fn desktop_file_content() -> String {
     s.push_str("NoDisplay=false\n");
     s.push_str("X-Pkgbridge=true\n");
     s
+}
+
+fn resolve_exec_bin() -> String {
+    // Try path of the running executable first
+    if let Ok(p) = std::env::current_exe() {
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.is_file() {
+                if let Some(s) = p.to_str() { return s.to_string(); }
+            }
+        }
+    }
+    // Fallback to PATH lookup
+    if let Ok(p) = which::which("pkgbridge") {
+        if let Some(s) = p.to_str() { return s.to_string(); }
+    }
+    // Last resort: bare name
+    "pkgbridge".to_string()
 }
 
 fn try_run(cmd: &str, args: &[&str]) -> Result<()> {

@@ -3,7 +3,7 @@
 <img src="pkgbridge.png" alt="pkgbridge" width="128" />
 
 # pkgbridge
-
+# NOTE THIS IS ALPHA SOFTWARE AND NOT READY FOR USE.
 Cross‑distro package installer/exporter for Distrobox. Install native packages (.deb/.rpm) into the right container, then expose both CLI binaries and desktop apps back on your host. Includes host shims for apt/dnf/zypper/pacman that operate inside a chosen Distrobox.
 
 </div>

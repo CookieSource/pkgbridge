@@ -165,8 +165,21 @@ fn install_like(arg: FileArg, cli: &Cli) -> Result<()> {
     // Install the package as root
     let install_cmd = build_install_cmd_root(&fmt, &in_box_path);
     println!("Installing inside box '{}'...", selected.name);
-    let ok = distro::enter_status(&selected.name, &install_cmd, true)?;
-    if !ok { return Err(anyhow!("installation command failed inside container")); }
+    let mut ok = distro::enter_status(&selected.name, &install_cmd, true)?;
+    if !ok {
+        // Fallback to using sudo/doas/non-root execution inside the container
+        let sudo_cmd = format!("sudo {}", install_cmd);
+        let doas_cmd = format!("doas {}", install_cmd);
+        for cmd in [&sudo_cmd, &doas_cmd, &install_cmd] {
+            if distro::enter_status(&selected.name, cmd, false)? {
+                ok = true;
+                break;
+            }
+        }
+    }
+    if !ok {
+        return Err(anyhow!("installation command failed inside container"));
+    }
     println!("Install completed.");
     if !cli.no_export {
         export_items(&selected.name, &bins, &apps)?;

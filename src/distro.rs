@@ -23,10 +23,7 @@ pub enum Family {
 /// - Fallback to `distrobox list` and attempt simple parsing.
 pub fn discover_boxes() -> Result<Vec<DistroBox>> {
     // Try JSON mode first
-    let json_out = Command::new("distrobox")
-        .arg("list")
-        .arg("--json")
-        .output();
+    let json_out = Command::new("distrobox").arg("list").arg("--json").output();
 
     if let Ok(out) = json_out {
         if out.status.success() {
@@ -40,7 +37,10 @@ pub fn discover_boxes() -> Result<Vec<DistroBox>> {
     }
 
     // Fallback to plain text
-    let out = Command::new("distrobox").arg("list").output().with_context(|| "running 'distrobox list'")?;
+    let out = Command::new("distrobox")
+        .arg("list")
+        .output()
+        .with_context(|| "running 'distrobox list'")?;
     if !out.status.success() {
         // Not found or error; return empty gracefully
         return Ok(vec![]);
@@ -68,14 +68,22 @@ fn parse_boxes_json(s: &str) -> Result<Vec<DistroBox>> {
         let arr: Vec<JsonBox> = serde_json::from_str(s)?;
         Ok(arr
             .into_iter()
-            .map(|j| DistroBox { name: j.name, image: j.image, runtime: j.engine.unwrap_or_else(|| "unknown".into()) })
+            .map(|j| DistroBox {
+                name: j.name,
+                image: j.image,
+                runtime: j.engine.unwrap_or_else(|| "unknown".into()),
+            })
             .collect())
     } else {
         let obj: JsonList = serde_json::from_str(s)?;
         Ok(obj
             .containers
             .into_iter()
-            .map(|j| DistroBox { name: j.name, image: j.image, runtime: j.engine.unwrap_or_else(|| "unknown".into()) })
+            .map(|j| DistroBox {
+                name: j.name,
+                image: j.image,
+                runtime: j.engine.unwrap_or_else(|| "unknown".into()),
+            })
             .collect())
     }
 }
@@ -88,45 +96,77 @@ fn parse_boxes_plain(s: &str) -> Vec<DistroBox> {
     let mut saw_pipe_header = false;
     for line in s.lines() {
         let t = line.trim();
-        if t.is_empty() { continue; }
+        if t.is_empty() {
+            continue;
+        }
 
         if t.contains('|') {
             // Pipe-separated table
             // Split and trim columns
             let mut cols: Vec<String> = t.split('|').map(|c| c.trim().to_string()).collect();
             // Skip header row
-            if cols.iter().any(|c| c.eq_ignore_ascii_case("NAME")) && cols.iter().any(|c| c.eq_ignore_ascii_case("ID")) {
+            if cols.iter().any(|c| c.eq_ignore_ascii_case("NAME"))
+                && cols.iter().any(|c| c.eq_ignore_ascii_case("ID"))
+            {
                 saw_pipe_header = true;
                 continue;
             }
             // Skip separators like "+---" if present
-            if cols.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == '+')) { continue; }
+            if cols
+                .iter()
+                .all(|c| c.chars().all(|ch| ch == '-' || ch == '+'))
+            {
+                continue;
+            }
             if cols.len() >= 2 {
                 let name = cols.get(1).cloned().unwrap_or_default();
-                if name.is_empty() || name.eq_ignore_ascii_case("NAME") { continue; }
+                if name.is_empty() || name.eq_ignore_ascii_case("NAME") {
+                    continue;
+                }
                 let image = cols.get(3).cloned();
-                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+                boxes.push(DistroBox {
+                    name,
+                    image,
+                    runtime: "unknown".into(),
+                });
                 continue;
             }
         }
 
         // Fallback heuristic for plain whitespace formats
-        if t.starts_with("NAME") || t.starts_with("+---") || t.contains("CONTAINER ID") || t.eq_ignore_ascii_case("id") {
+        if t.starts_with("NAME")
+            || t.starts_with("+---")
+            || t.contains("CONTAINER ID")
+            || t.eq_ignore_ascii_case("id")
+        {
             continue;
         }
         let parts: Vec<&str> = t.split_whitespace().collect();
         if parts.len() >= 1 {
             // If we saw a pipe header earlier, the first column here is likely ID; skip such lines
-            if saw_pipe_header && parts.get(0).map(|c| c.len()).unwrap_or(0) >= 6 && parts.get(1).is_some() {
+            if saw_pipe_header
+                && parts.get(0).map(|c| c.len()).unwrap_or(0) >= 6
+                && parts.get(1).is_some()
+            {
                 // Likely an ID then NAME; take NAME
                 let name = parts.get(1).unwrap().to_string();
                 let image = parts.get(3).map(|s| s.to_string());
-                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+                boxes.push(DistroBox {
+                    name,
+                    image,
+                    runtime: "unknown".into(),
+                });
             } else {
                 let name = parts[0].to_string();
-                if name.eq_ignore_ascii_case("NAME") || name.eq_ignore_ascii_case("Created") { continue; }
+                if name.eq_ignore_ascii_case("NAME") || name.eq_ignore_ascii_case("Created") {
+                    continue;
+                }
                 let image = parts.get(1).map(|s| s.to_string());
-                boxes.push(DistroBox { name, image, runtime: "unknown".into() });
+                boxes.push(DistroBox {
+                    name,
+                    image,
+                    runtime: "unknown".into(),
+                });
             }
         }
     }
@@ -136,11 +176,21 @@ fn parse_boxes_plain(s: &str) -> Vec<DistroBox> {
 /// Classify a Distrobox into a Linux distribution family by reading /etc/os-release inside it.
 pub fn classify_box_family(name: &str) -> Result<Family> {
     let out = Command::new("distrobox")
-        .args(["enter", "-n", name, "--", "sh", "-lc", "cat /etc/os-release 2>/dev/null || true"])
+        .args([
+            "enter",
+            "-n",
+            name,
+            "--",
+            "sh",
+            "-lc",
+            "cat /etc/os-release 2>/dev/null || true",
+        ])
         .output()
         .with_context(|| format!("running 'distrobox enter' for {name}"))?;
     if !out.status.success() {
-        return Err(anyhow!("failed to enter box {name} to read /etc/os-release"));
+        return Err(anyhow!(
+            "failed to enter box {name} to read /etc/os-release"
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let (id, id_like) = parse_os_release(text.as_ref());
@@ -152,7 +202,9 @@ fn parse_os_release(s: &str) -> (Option<String>, Vec<String>) {
     let mut id_like: Vec<String> = Vec::new();
     for line in s.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("ID=") {
             id = Some(unquote(rest).to_ascii_lowercase());
         } else if let Some(rest) = line.strip_prefix("ID_LIKE=") {
@@ -167,18 +219,30 @@ fn unquote(s: &str) -> String {
     let t = s.trim();
     if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
         t[1..t.len().saturating_sub(1)].to_string()
-    } else { t.to_string() }
+    } else {
+        t.to_string()
+    }
 }
 
 fn classify_ids(id: &Option<String>, id_like: &Vec<String>) -> Option<Family> {
     let mut tokens: Vec<String> = Vec::new();
-    if let Some(i) = id { tokens.push(i.clone()); }
+    if let Some(i) = id {
+        tokens.push(i.clone());
+    }
     tokens.extend(id_like.clone());
     let has = |k: &str| tokens.iter().any(|t| t == k);
-    if has("debian") || has("ubuntu") { return Some(Family::Debian); }
-    if has("fedora") || has("rhel") || has("centos") { return Some(Family::Fedora); }
-    if has("opensuse") || has("sles") || has("suse") { return Some(Family::OpenSuse); }
-    if has("arch") || has("manjaro") || has("endeavouros") { return Some(Family::Arch); }
+    if has("debian") || has("ubuntu") {
+        return Some(Family::Debian);
+    }
+    if has("fedora") || has("rhel") || has("centos") {
+        return Some(Family::Fedora);
+    }
+    if has("opensuse") || has("sles") || has("suse") {
+        return Some(Family::OpenSuse);
+    }
+    if has("arch") || has("manjaro") || has("endeavouros") {
+        return Some(Family::Arch);
+    }
     None
 }
 
@@ -198,38 +262,64 @@ pub fn create_box(name: &str, image: &str) -> Result<()> {
 pub fn enter_capture(name: &str, cmd: &str, as_root: bool) -> Result<std::process::Output> {
     let mut c = Command::new("distrobox");
     c.arg("enter");
-    if as_root { c.arg("--root"); }
+    if as_root {
+        c.arg("--root");
+    }
     c.args(["-n", name, "--", "sh", "-lc", cmd]);
-    let out = c.output().with_context(|| format!("entering box {name} to run: {cmd}"))?;
+    let out = c
+        .output()
+        .with_context(|| format!("entering box {name} to run: {cmd}"))?;
     Ok(out)
 }
 
 /// Run a command inside a distrobox and return exit status only
 pub fn enter_status(name: &str, cmd: &str, as_root: bool) -> Result<bool> {
-    let out = enter_capture(name, cmd, as_root)?;
-    Ok(out.status.success())
+    let mut c = Command::new("distrobox");
+    c.arg("enter");
+    if as_root {
+        c.arg("--root");
+    }
+    c.args(["-n", name, "--", "sh", "-lc", cmd]);
+    // Inherit stdio so that interactive prompts (passwords, confirmations) are
+    // forwarded directly to the user. Using `status()` avoids capturing output
+    // and allows the child process to interact with the terminal.
+    let status = c
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("entering box {name} to run: {cmd}"))?;
+    Ok(status.success())
 }
 
 /// Copy a local file into the box at /tmp/pkgbridge/<sanitized-basename> via stdin piping.
 /// Returns the destination path inside the container.
 pub fn copy_into_box(name: &str, local_path: &std::path::Path) -> Result<String> {
-    let data = std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
+    let data =
+        std::fs::read(local_path).with_context(|| format!("reading {}", local_path.display()))?;
     let base = local_path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("package");
     let mut sanitized = String::new();
     for ch in base.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' { sanitized.push(ch); } else { sanitized.push('_'); }
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
     }
-    if sanitized.is_empty() { sanitized.push_str("package"); }
+    if sanitized.is_empty() {
+        sanitized.push_str("package");
+    }
     let dest = format!("/tmp/pkgbridge/{sanitized}");
     let quoted = shell_escape::escape(std::borrow::Cow::from(dest.clone()));
     let cmd = format!("mkdir -p /tmp/pkgbridge && cat > {quoted}");
 
     let mut child = Command::new("distrobox")
         .arg("enter")
-        .arg("-n").arg(name)
+        .arg("-n")
+        .arg(name)
         .args(["--", "sh", "-lc", &cmd])
         .stdin(Stdio::piped())
         .spawn()

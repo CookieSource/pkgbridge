@@ -1,5 +1,5 @@
-use crate::distro::Family;
 use crate::config;
+use crate::distro::Family;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -8,7 +8,8 @@ use which::which;
 
 pub fn set_default(fam: Family, box_name: &str) -> Result<()> {
     let mut cfg = config::load_config();
-    cfg.pm_defaults.insert(family_key(fam).into(), box_name.to_string());
+    cfg.pm_defaults
+        .insert(family_key(fam).into(), box_name.to_string());
     config::save_config(&cfg)
 }
 
@@ -19,7 +20,9 @@ pub fn show_defaults() -> HashMap<String, String> {
 pub fn generate_shims() -> Result<()> {
     let cfg = config::load_config();
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let bindir: PathBuf = std::env::var("XDG_BIN_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(format!("{home}/.local/bin")));
+    let bindir: PathBuf = std::env::var("XDG_BIN_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{home}/.local/bin")));
     fs::create_dir_all(&bindir).ok();
     for (fam_key, box_name) in cfg.pm_defaults.iter() {
         match fam_key.as_str() {
@@ -46,10 +49,11 @@ pub fn write_shim(dir: &PathBuf, name: &str, box_name: &str, fam_key: &str) -> R
     let path = dir.join(name);
     // Try to run the package manager as root inside the container.
     // Fallbacks: attempt with sudo/doas inside container, then non-root (may fail for ops requiring privileges).
-    let content = format!("#!/usr/bin/env sh\nset -e\nbox=\"{}\"\nfam=\"{}\"\n# Pre-transaction snapshot\npkgbridge pm snapshot --family \"$fam\" --container \"$box\" >/dev/null 2>&1 || true\nstatus=0\nif distrobox enter --root -n \"$box\" -- true >/dev/null 2>&1; then\n  distrobox enter --root -n \"$box\" -- {} \"$@\" || status=$?\nelse\n  if distrobox enter -n \"$box\" -- sudo -n true >/dev/null 2>&1; then\n    distrobox enter -n \"$box\" -- sudo -n {} \"$@\" || status=$?\n  elif distrobox enter -n \"$box\" -- doas true >/dev/null 2>&1; then\n    distrobox enter -n \"$box\" -- doas {} \"$@\" || status=$?\n  else\n    distrobox enter -n \"$box\" -- {} \"$@\" || status=$?\n  fi\nfi\n# Post-transaction export\npkgbridge pm post-transaction --family \"$fam\" --container \"$box\" >/dev/null 2>&1 || true\nexit $status\n", box_name, fam_key, name, name, name, name);
+    let content = format!("#!/usr/bin/env sh\nset -e\nbox=\"{}\"\nfam=\"{}\"\n# Pre-transaction snapshot\npkgbridge pm snapshot --family \"$fam\" --container \"$box\" >/dev/null 2>&1 || true\nstatus=0\nif distrobox enter --root -n \"$box\" -- true >/dev/null 2>&1; then\n  distrobox enter --root -n \"$box\" -- {} \"$@\" || status=$?\nelse\n  if distrobox enter -n \"$box\" -- command -v sudo >/dev/null 2>&1; then\n    distrobox enter -n \"$box\" -- sudo {} \"$@\" || status=$?\n  elif distrobox enter -n \"$box\" -- command -v doas >/dev/null 2>&1; then\n    distrobox enter -n \"$box\" -- doas {} \"$@\" || status=$?\n  else\n    distrobox enter -n \"$box\" -- {} \"$@\" || status=$?\n  fi\nfi\n# Post-transaction export\npkgbridge pm post-transaction --family \"$fam\" --container \"$box\" >/dev/null 2>&1 || true\nexit $status\n", box_name, fam_key, name, name, name, name);
     fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
     let mut perms = fs::metadata(&path)?.permissions();
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms)?;
@@ -58,10 +62,20 @@ pub fn write_shim(dir: &PathBuf, name: &str, box_name: &str, fam_key: &str) -> R
 }
 
 pub fn family_key(f: Family) -> &'static str {
-    match f { Family::Debian => "debian", Family::Fedora => "fedora", Family::OpenSuse => "opensuse", Family::Arch => "arch" }
+    match f {
+        Family::Debian => "debian",
+        Family::Fedora => "fedora",
+        Family::OpenSuse => "opensuse",
+        Family::Arch => "arch",
+    }
 }
 
-fn generate_shim_with_policy(bindir: &PathBuf, name: &str, box_name: &str, fam_key: &str) -> Result<()> {
+fn generate_shim_with_policy(
+    bindir: &PathBuf,
+    name: &str,
+    box_name: &str,
+    fam_key: &str,
+) -> Result<()> {
     // If the host already has this package manager (and it's not our own shim in bindir),
     // avoid overshadowing it. Instead, create a suffixed wrapper like "apt-<box>".
     let host_has = host_has_cmd_outside_bindir(name, bindir);
@@ -105,6 +119,12 @@ fn host_has_cmd_outside_bindir(cmd: &str, bindir: &PathBuf) -> bool {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }

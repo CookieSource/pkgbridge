@@ -198,6 +198,8 @@ pub fn create_box(name: &str, image: &str) -> Result<()> {
 pub fn enter_capture(name: &str, cmd: &str, as_root: bool) -> Result<std::process::Output> {
     let mut c = Command::new("distrobox");
     c.arg("enter");
+    // Non-interactive: avoid TTY allocation to prevent hangs
+    c.arg("--no-tty");
     if as_root { c.arg("--root"); }
     c.args(["-n", name, "--", "sh", "-lc", cmd]);
     let out = c.output().with_context(|| format!("entering box {name} to run: {cmd}"))?;
@@ -206,8 +208,27 @@ pub fn enter_capture(name: &str, cmd: &str, as_root: bool) -> Result<std::proces
 
 /// Run a command inside a distrobox and return exit status only
 pub fn enter_status(name: &str, cmd: &str, as_root: bool) -> Result<bool> {
-    let out = enter_capture(name, cmd, as_root)?;
-    Ok(out.status.success())
+    // Use no-tty as well
+    let mut c = Command::new("distrobox");
+    c.arg("enter");
+    c.arg("--no-tty");
+    if as_root { c.arg("--root"); }
+    c.args(["-n", name, "--", "sh", "-lc", cmd]);
+    let st = c.status().with_context(|| format!("entering box {} to run (status): {}", name, cmd))?;
+    Ok(st.success())
+}
+
+/// Run a command inside a distrobox with inherited stdio (TTY forwarding)
+pub fn enter_status_inherit(name: &str, cmd: &str, as_root: bool) -> Result<bool> {
+    let mut c = Command::new("distrobox");
+    c.arg("enter");
+    if as_root { c.arg("--root"); }
+    c.args(["-n", name, "--", "sh", "-lc", cmd]);
+    c.stdin(Stdio::inherit());
+    c.stdout(Stdio::inherit());
+    c.stderr(Stdio::inherit());
+    let st = c.status().with_context(|| format!("entering box {} to run (interactive): {}", name, cmd))?;
+    Ok(st.success())
 }
 
 /// Copy a local file into the box at /tmp/pkgbridge/<sanitized-basename> via stdin piping.
@@ -225,10 +246,20 @@ pub fn copy_into_box(name: &str, local_path: &std::path::Path) -> Result<String>
     if sanitized.is_empty() { sanitized.push_str("package"); }
     let dest = format!("/tmp/pkgbridge/{sanitized}");
     let quoted = shell_escape::escape(std::borrow::Cow::from(dest.clone()));
-    let cmd = format!("mkdir -p /tmp/pkgbridge && cat > {quoted}");
+    let hostp = shell_escape::escape(std::borrow::Cow::from(local_path.to_string_lossy().to_string()));
 
+    // First, try an in-container cp from the host path (home is usually bind-mounted by distrobox)
+    let cp_cmd = format!("set -e; mkdir -p /tmp/pkgbridge; if [ -r {host} ]; then cp -f {host} {dst}; exit 0; else exit 1; fi", host=hostp, dst=quoted);
+    let mut try_cp = Command::new("distrobox");
+    try_cp.arg("enter").arg("--no-tty").arg("-n").arg(name).args(["--", "sh", "-lc", &cp_cmd]);
+    let cp_status = try_cp.status().with_context(|| format!("attempting in-container cp into {name}"))?;
+    if cp_status.success() { return Ok(dest); }
+
+    // Fallback: stream bytes via stdin and cat > dest (no TTY)
+    let cmd = format!("set -e; mkdir -p /tmp/pkgbridge && cat > {quoted}");
     let mut child = Command::new("distrobox")
         .arg("enter")
+        .arg("--no-tty")
         .arg("-n").arg(name)
         .args(["--", "sh", "-lc", &cmd])
         .stdin(Stdio::piped())

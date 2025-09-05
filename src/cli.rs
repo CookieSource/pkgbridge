@@ -156,17 +156,85 @@ fn install_like(arg: FileArg, cli: &Cli) -> Result<()> {
         println!("--dry-run: stopping before any installation/export work.");
         return Ok(());
     }
+    // If non-interactive and a password seed is provided, set it before any container entry
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !interactive {
+        if let Ok(pw) = std::env::var("PKGBRIDGE_INIT_PASSWORD") {
+            preseed_password_root(&selected.name, &pw).ok();
+        }
+    }
     // Copy the package into the container to a temp path
     let in_box_path = distro::copy_into_box(&selected.name, &path).context("copying package into container")?;
+    // Verify copy size to avoid corrupted installs due to TTY/pipe issues
+    if let Ok(meta) = std::fs::metadata(&path) {
+        let host_sz = meta.len();
+        let q = shell_escape::escape(std::borrow::Cow::from(in_box_path.clone()));
+        let cmd = format!("stat -c %s {} 2>/dev/null || wc -c < {} 2>/dev/null", q, q);
+        if let Ok(out) = distro::enter_capture(&selected.name, &cmd, false) {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    if let Some(tok) = s.split_whitespace().next() {
+                        if let Ok(n) = tok.trim().parse::<u64>() {
+                            if n != host_sz { return Err(anyhow!("copied file size mismatch inside container: expected {} bytes, got {} (path: {})", host_sz, n, in_box_path)); }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Pre-scan contents to identify bins and desktop files
     let (mut bins, mut apps) = prescan_package(&selected.name, &fmt, &in_box_path)?;
     if !cli.bin.is_empty() { bins = cli.bin.clone(); }
     if !cli.app.is_empty() { apps = cli.app.clone(); }
-    // Install the package as root
-    let install_cmd = build_install_cmd_root(&fmt, &in_box_path);
+    // Build both user and root install commands. Prefer user+sudo in interactive sessions
+    // to forward password prompts; fallback to root if needed.
+    let user_cmd = build_install_cmd_user(&fmt, &in_box_path);
+    let root_cmd = build_install_cmd_root(&fmt, &in_box_path);
     println!("Installing inside box '{}'...", selected.name);
-    let ok = distro::enter_status(&selected.name, &install_cmd, true)?;
-    if !ok { return Err(anyhow!("installation command failed inside container")); }
+
+    // Interactive or non-interactive execution depending on TTY
+
+    // Prefer interactive execution to forward password prompts to user
+    let ok = if interactive {
+        // 1) Try as normal user (sudo/doas will prompt interactively)
+        log::debug!("install (user) cmd: {}", user_cmd);
+        match distro::enter_status_inherit(&selected.name, &user_cmd, false) {
+            Ok(true) => true,
+            _ => {
+                // 2) Fallback to root (no prompts)
+                log::debug!("install (root fallback) cmd: {}", root_cmd);
+                match distro::enter_status_inherit(&selected.name, &root_cmd, true) {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(_) => false,
+                }
+            }
+        }
+    } else {
+        // Non-interactive: try root first, then user without prompts
+        log::debug!("install (root, non-interactive) cmd: {}", root_cmd);
+        match distro::enter_status(&selected.name, &root_cmd, true) {
+            Ok(true) => true,
+            _ => {
+                log::debug!("install (user, non-interactive) fallback cmd: {}", user_cmd);
+                match distro::enter_status(&selected.name, &user_cmd, false) {
+                    Ok(true) => true,
+                    _ => false,
+                }
+            }
+        }
+    };
+
+    if !ok {
+        // Re-run in non-interactive mode to capture error details
+        // Capture diagnostics from both paths to provide helpful output
+        let mut details = String::new();
+        let diag_root = distro::enter_capture(&selected.name, &format!("{} 2>&1 || true", root_cmd), true);
+        if let Ok(out) = diag_root { details.push_str(&String::from_utf8_lossy(&out.stdout)); details.push_str(&String::from_utf8_lossy(&out.stderr)); }
+        let diag_user = distro::enter_capture(&selected.name, &format!("{} 2>&1 || true", user_cmd), false);
+        if let Ok(out) = diag_user { details.push_str(&String::from_utf8_lossy(&out.stdout)); details.push_str(&String::from_utf8_lossy(&out.stderr)); }
+        return Err(anyhow!("installation command failed inside container. Details:\n{}", details.trim()));
+    }
     println!("Install completed.");
     if !cli.no_export {
         export_items(&selected.name, &bins, &apps)?;
@@ -315,17 +383,30 @@ fn select_or_create(boxes: &[distro::DistroBox], fmt: &PackageFormat, cli: &Cli)
         return Ok(SelectedBox { name, family: fam });
     }
 
-    // None found: create if requested
+    // None found: create interactively or via --create
+    let fam = target_families[0];
+    let (default_name, default_image) = default_box_for_family(fam);
+    let chosen_image = cli.create_image.clone().unwrap_or_else(|| default_image.to_string());
     if cli.create {
-        let fam = target_families[0];
-        let (name, image) = default_box_for_family(fam);
-        let image = cli.create_image.clone().unwrap_or_else(|| image.to_string());
-        println!("No matching box found. Creating '{}' from '{}'...", name, image);
-        distro::create_box(name, &image)?;
-        return Ok(SelectedBox { name: name.to_string(), family: fam });
+        println!("No matching box found. Creating '{}' from '{}'...", default_name, chosen_image);
+        distro::create_box(default_name, &chosen_image)?;
+        return Ok(SelectedBox { name: default_name.to_string(), family: fam });
+    }
+    // If interactive TTY, offer to create automatically
+    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        println!("No matching box found for family '{}'.", format_family(fam));
+        println!("I can create '{}' from '{}' now.", default_name, chosen_image);
+        print!("Create it? [Y/n] ");
+        use std::io::Write; let _ = std::io::stdout().flush();
+        let mut buf = String::new(); let _ = std::io::stdin().read_line(&mut buf);
+        let ans = buf.trim().to_ascii_lowercase();
+        if ans.is_empty() || ans == "y" || ans == "yes" {
+            distro::create_box(default_name, &chosen_image)?;
+            return Ok(SelectedBox { name: default_name.to_string(), family: fam });
+        }
     }
 
-    Err(anyhow!("no matching box found; rerun with --create or specify --container/--family"))
+    Err(anyhow!("no matching box found; re-run with --create, pass --container/--family, or answer 'Y' when prompted"))
 }
 
 fn default_box_for_family(f: BoxFamily) -> (&'static str, &'static str) {
@@ -338,11 +419,73 @@ fn default_box_for_family(f: BoxFamily) -> (&'static str, &'static str) {
 }
 
 fn build_install_cmd_root(fmt: &PackageFormat, path: &str) -> String {
+    // Root-mode installer: robust for local files and resolves dependencies
+    // - Debian: dpkg -i file, then apt/apt-get -f install
+    // - RPM families: dnf/zypper install the file directly
     let p = shell_escape::escape(std::borrow::Cow::from(path.to_string()));
     match fmt {
-        PackageFormat::Deb => format!("set -e; if command -v apt-get >/dev/null; then apt-get -y update && apt-get -y install {}; else dpkg -i {} || apt-get -y -f install || true; fi", p, p),
-        PackageFormat::Rpm => format!("set -e; if command -v dnf >/dev/null; then dnf -y install {}; elif command -v zypper >/dev/null; then zypper --non-interactive install {}; else rpm -i {}; fi", p, p, p),
+        PackageFormat::Deb => {
+            // Use apt-get/apt to update indexes first, then dpkg -i and fix deps
+            // Ensure we don't stop on the dpkg failure that triggers dependency fixing
+            format!(
+                "set -e; \
+                 if command -v apt-get >/dev/null; then apt-get -y update; elif command -v apt >/dev/null; then apt -y update; fi; \
+                 dpkg -i {} || {{ \
+                   if command -v apt-get >/dev/null; then apt-get -y -f install; \
+                   elif command -v apt >/dev/null; then apt -y -f install; \
+                   else printf %s\\n apt-not-found >&2; exit 1; fi; \
+                 }}",
+                p
+            )
+        }
+        PackageFormat::Rpm => {
+            format!(
+                "set -e; \
+                 if command -v dnf >/dev/null; then dnf -y install {}; \
+                 elif command -v zypper >/dev/null; then zypper --non-interactive install {}; \
+                 else rpm -i {}; fi",
+                p, p, p
+            )
+        }
     }
+}
+
+fn build_install_cmd_user(fmt: &PackageFormat, path: &str) -> String {
+    let p = shell_escape::escape(std::borrow::Cow::from(path.to_string()));
+    let inner = match fmt {
+        PackageFormat::Deb => format!(
+            "set -e; if command -v apt-get >/dev/null; then apt-get -y update; elif command -v apt >/dev/null; then apt -y update; fi; dpkg -i {} || {{ if command -v apt-get >/dev/null; then apt-get -y -f install; elif command -v apt >/dev/null; then apt -y -f install; else true; fi; }}",
+            p
+        ),
+        PackageFormat::Rpm => format!(
+            "set -e; if command -v dnf >/dev/null; then dnf -y install {}; elif command -v zypper >/dev/null; then zypper --non-interactive install {}; else rpm -i {}; fi",
+            p, p, p
+        ),
+    };
+    // Prefer sudo (passwordless or interactive), then doas, else run without elevation (may fail)
+    format!(
+        "set -e; if command -v sudo >/dev/null; then if sudo -n true >/dev/null 2>&1; then sudo sh -lc '{}' ; else sudo sh -lc '{}' ; fi; elif command -v doas >/dev/null; then doas sh -lc '{}' ; else sh -lc '{}' ; fi",
+        inner, inner, inner, inner
+    )
+}
+
+fn build_install_cmd_user_noninteractive(fmt: &PackageFormat, path: &str) -> String {
+    let p = shell_escape::escape(std::borrow::Cow::from(path.to_string()));
+    let inner = match fmt {
+        PackageFormat::Deb => format!(
+            "set -e; if command -v apt-get >/dev/null; then apt-get -y update; elif command -v apt >/dev/null; then apt -y update; fi; dpkg -i {} || {{ if command -v apt-get >/dev/null; then apt-get -y -f install; elif command -v apt >/dev/null; then apt -y -f install; else true; fi; }}",
+            p
+        ),
+        PackageFormat::Rpm => format!(
+            "set -e; if command -v dnf >/dev/null; then dnf -y install {}; elif command -v zypper >/dev/null; then zypper --non-interactive install {}; else rpm -i {}; fi",
+            p, p, p
+        ),
+    };
+    // Force non-interactive sudo so we can capture errors, even if it fails due to needing a password
+    format!(
+        "set -e; if command -v sudo >/dev/null; then sudo -n sh -lc '{}' ; elif command -v doas >/dev/null; then doas sh -lc '{}' ; else sh -lc '{}' ; fi",
+        inner, inner, inner
+    )
 }
 
 fn prescan_package(box_name: &str, fmt: &PackageFormat, in_box_path: &str) -> Result<(Vec<String>, Vec<String>)> {
@@ -440,7 +583,11 @@ fn export_items(box_name: &str, bins: &[String], apps: &[String]) -> Result<()> 
             println!("App collision for '{}'; exported as '{}'", base, alt_name);
             continue;
         }
-        if export_app(box_name, base) {
+        // For export, prefer absolute path when we know it's a desktop file
+        let export_target = if app.contains('/') || base.ends_with(".desktop") {
+            if app.starts_with('/') { app.to_string() } else { format!("/usr/share/applications/{}", base) }
+        } else { base.to_string() };
+        if export_app(box_name, &export_target) {
             println!("Exported app: {}", base);
         } else {
             eprintln!("Warning: failed exporting app {}", base);
@@ -504,16 +651,25 @@ fn export_bin(box_name: &str, bin: &str) -> bool {
     }
 }
 
-fn export_app(box_name: &str, app_base: &str) -> bool {
+fn export_app(box_name: &str, app_spec: &str) -> bool {
+    // Normalize: if caller passed only a basename ending with .desktop, use absolute path
+    // Accepted by distrobox-export: app name (without .desktop) or absolute path to .desktop
+    let normalized = if app_spec.contains('/') {
+        app_spec.to_string()
+    } else if app_spec.ends_with(".desktop") {
+        format!("/usr/share/applications/{}", app_spec)
+    } else {
+        app_spec.to_string()
+    };
     let supports = dbe_supports_container_flag();
     if supports {
         let status = std::process::Command::new("distrobox-export")
-            .args(["--container", box_name, "--app", app_base])
+            .args(["--container", box_name, "--app", &normalized])
             .status();
         return matches!(status, Ok(s) if s.success());
     } else {
         let status = std::process::Command::new("distrobox")
-            .args(["enter", "-n", box_name, "--", "distrobox-export", "--app", app_base])
+            .args(["enter", "-n", box_name, "--", "distrobox-export", "--app", &normalized])
             .status();
         return matches!(status, Ok(s) if s.success());
     }
@@ -587,14 +743,55 @@ fn unexport_items(box_name: &str, bins: &[String], apps: &[String]) {
 
 fn uninstall_inside(box_name: &str, fam: BoxFamily, pkg: &str, dry_run: bool) -> Result<bool> {
     let p = shell_escape::escape(std::borrow::Cow::from(pkg.to_string()));
-    let cmd = match fam {
+    let inner = match fam {
         BoxFamily::Debian => format!("set -e; if command -v apt-get >/dev/null; then apt-get -y remove {}; else dpkg -r {}; fi", p, p),
         BoxFamily::Fedora => format!("set -e; if command -v dnf >/dev/null; then dnf -y remove {}; else rpm -e {}; fi", p, p),
         BoxFamily::OpenSuse => format!("set -e; if command -v zypper >/dev/null; then zypper --non-interactive rm {}; else rpm -e {}; fi", p, p),
         BoxFamily::Arch => format!("set -e; if command -v pacman >/dev/null; then pacman -R --noconfirm {}; else echo 'pacman not found' >&2; exit 1; fi", p),
     };
+    let cmd = format!(
+        "set -e; if command -v sudo >/dev/null; then if sudo -n true >/dev/null 2>&1; then sudo sh -lc '{}' ; else sudo sh -lc '{}' ; fi; elif command -v doas >/dev/null; then doas sh -lc '{}' ; else sh -lc '{}' ; fi",
+        inner, inner, inner, inner
+    );
     if dry_run { println!("--dry-run: would run inside '{}': {}", box_name, cmd); return Ok(true); }
-    distro::enter_status(box_name, &cmd, true)
+    distro::enter_status(box_name, &cmd, false)
+}
+
+fn preseed_password(box_name: &str, password: &str) -> Result<()> {
+    // One-time, opt-in: set the user password via root so future sudo prompts work non-interactively too
+    // Determine a likely non-root user from /etc/passwd (first uid >= 1000), then set its password via chpasswd
+    return preseed_password_root(box_name, password);
+    /*
+    let pw = shell_escape::escape(std::borrow::Cow::from(password.to_string()));
+    let cmd = format!(
+        "u=$(awk -F: '$3>=1000 && $1!="nobody" {print $1; exit}' /etc/passwd); \
+         if [ -z \"$u\" ]; then u=$(getent passwd 1000 | cut -d: -f1 || true); fi; \
+         if [ -z \"$u\" ]; then u=$(getent passwd 1001 | cut -d: -f1 || true); fi; \
+         if [ -z \"$u\" ]; then echo 'no non-root user found' >&2; exit 1; fi; \
+         printf '%s:%s\n' \"$u\" {} | chpasswd",
+        pw
+    );
+    let ok = distro::enter_status(box_name, &cmd, true).context("setting initial password via chpasswd (root)")?;
+    if !ok { return Err(anyhow!("failed to set initial password in container")); }
+    */
+    Ok(())
+}
+
+fn preseed_password_root(box_name: &str, password: &str) -> Result<()> {
+    // Opt-in: set the password for the first non-system user (uid>=1000) via chpasswd as root.
+    let pw = shell_escape::escape(std::borrow::Cow::from(password.to_string()));
+    // Verify we can enter as root; if not, skip silently
+    if !distro::enter_status(box_name, "true", true).unwrap_or(false) {
+        return Ok(());
+    }
+    let cmd = format!(r#"u=$(awk -F: '$3>=1000 && $1!="nobody" {{print $1; exit}}' /etc/passwd); \
+         if [ -z "$u" ]; then u=$(getent passwd 1000 | cut -d: -f1 || true); fi; \
+         if [ -z "$u" ]; then u=$(getent passwd 1001 | cut -d: -f1 || true); fi; \
+         if [ -z "$u" ]; then echo 'no non-root user found' >&2; exit 1; fi; \
+         printf '%s:%s\n' "$u" {} | chpasswd"#, pw);
+    let ok = distro::enter_status(box_name, &cmd, true).context("setting initial password via chpasswd (root)")?;
+    if !ok { return Err(anyhow!("failed to set initial password in container")); }
+    Ok(())
 }
 
 fn pm_cmd(cmd: PmCmd) -> Result<()> {
@@ -745,5 +942,7 @@ fn maybe_first_run_prompt() {
         }
         println!("First-run export completed.");
     }
+    // Also ensure bootstrap shims exist for missing host managers (apt/dnf/zypper/pacman)
+    let _ = pm::generate_bootstrap_shims();
     st.first_run_done = true; let _ = config::save_state(&st);
 }
